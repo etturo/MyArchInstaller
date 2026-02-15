@@ -1,6 +1,7 @@
 #!/bin/bash
 
 handle_error(){
+	echo ""
 	echo "[ERROR] - Line $1"
 	exit 1
 }
@@ -9,6 +10,76 @@ trap 'handle_error $LINENO' ERR
 
 # End the script if a command fails
 set -e
+
+# === SPINNER FUNCTION ===
+spinner() {
+	local pid=$!
+	local delay=0.1
+	local spinstr='|/-\'
+	echo -n "   "
+
+	# Hiding the cursor
+	tput civis
+
+	while ps -p $pid > /dev/null; do
+		local temp=${spinstr#?}
+   	   	printf " [%c]  " "$spinstr"
+   	   	local spinstr=$temp${spinstr%"$temp"}
+   	   	sleep $delay
+   	   	printf "\b\b\b\b\b\b"
+   	done
+
+	printf "    \b\b\b\b"
+	printf " [✓] \n"
+	tput cnorm
+}
+
+# Wrapper function to run command quietly with spinner
+run_quiet() {
+	echo -n "$1..."
+	("${@:2}") > /dev/null 2>&1 & 
+
+	spinner 
+}
+
+
+# === Setup Password and UserName ===
+get_credential() {
+	echo "----------------------------------------------------------------"
+	echo "USER CONDIGURATION"
+	echo "----------------------------------------------------------------"
+
+	read -p "Insert USERNAME: " USERNAME
+	
+	if [ -z "$USERNAME" ]; then
+		USERNAME="etturo"
+		echo "No name inserted, will be set: $USERNAME"
+	fi
+
+	while true; do
+		echo -n "Insert the PASSWORD: "
+		read -s PASSWORD
+		echo ""
+
+		echo -n "Confirm the PASSWORD: "
+		read -s PASSWORD_CONFIRM
+		echo ""
+
+		if [ -n "$PASSWORD" ] && [ "$PASSWORD" == "$PASSWORD_CONFIRM" ]; then
+			ROOT_PASSWORD="$PASSWORD"
+			echo "Password set SUCCESSFULLY!"
+			break
+		else
+			echo "Passwords doesn't match. Retry..."
+		fi
+	done
+
+	echo "----------------------------------------------------------------"
+	echo "Correctly got the credential. The installation will continue..."
+	echo "----------------------------------------------------------------"
+	sleep 2
+}
+
 
 # === Check Internet Connection ===
 
@@ -72,14 +143,14 @@ setup_internet() {
 	done
 }
 
-
+# Running initial Setup
 setup_internet
+get_credential
 
 
 # === Configuration Variables ===
 DISK="/dev/sda"
 HOSTNAME="SFINZIO"
-USERNAME="etturo"
 
 echo "Beginnning installation on $DISK"
 
@@ -108,13 +179,18 @@ echo "Erasing the whole disk ($DISK)..."
 #       invisible for libblkid. wipefs does not erase the filesystem
 #       itself nor any other data from the device.
 
-wipefs -a "$DISK"	# It removes the signature from the filesystem
+# wipefs -a "$DISK"	# It removes the signature from the filesystem
 
 # man sgdisk:
 # 	 sgdisk -Z stands for Zap (destroy) all the data structures needed
 # 	 for the partition on the disk, it wipe all the data on them.
 
-sgdisk -Z "$DISK" 2>/dev/null || true	# ignore the error if the disk is empty
+# sgdisk -Z "$DISK" 2>/dev/null || true	# ignore the error if the disk is empty
+
+# Running thoose command with the spinner visualizer
+run_quiet "Erasing disk signatures (wipefs)" wipefs -a "$DISK"
+run_quiet "Zapping partition table (sgdisk)" sgdisk -Z "$DISK"
+
 
 
 # === Automatic Partitioning ===
@@ -125,7 +201,7 @@ if [ "$UEFI" -eq 1 ]; then
 	# Part 3: Root
 	
 	echo "Creating Partitions GPT for UEFI layout"
-	sfdisk "$DISK" <<ENDSF
+	sfdisk "$DISK" > /dev/null 2>&1 <<ENDSF
 label: gpt
 ,512M,U
 ,8G,S
@@ -178,3 +254,63 @@ pacstrap -K /mnt base linux-zen linux-zen-headers linux-firmware vim nano networ
 echo "Generating fstab..."
 genfstab -U /mnt >> /mnt/etc/fstab
 
+
+# === System Configuration ===
+echo "Internal configuration started..."
+
+cat <<INTERNAL_EOF > /mnt/setup_internal.sh
+#!/bin/bash
+
+# Language and Time
+ln -sf /usr/share/zoneinfo/Europe/Rome /etc/localtime
+hwclock --systohc
+echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/locale.conf
+echo "$HOSTNAME" > /etc/hostname
+
+# Host condiguration
+echo "127.0.0.1	localhost" >> etc/hosts
+echo "::1	localhost" >> etc/hosts
+echo "127.0.1.1 $HOSTNAME.localdomain $HOSTNAME" >> etc/hosts
+
+# Creating User and setting the password
+echo "Creating user: $USERNAME"
+useradd -m -G wheel -s /bin/bash "$USERNAME"
+
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "root:$ROOT_PASSORD" | chpasswd
+
+# Setting SUDO
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
+
+# Installing BootLoader (GRUB)
+echo "Installing GRUB..."
+if [ "$UEFI" -eq 1 ]; then
+	grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+else
+	grub-install --target=i386-pc "$DISK"
+fi
+grub-mkconfig -o /boot/grub/grub.cfg
+
+# Starting Services
+systemtcl enable NetworkManager
+systemctl enable sshd
+
+INTERNAL_EOF
+
+echo "Entering the system (CHROOT)..."
+chmod +x /mnt/setup_internal.sh
+arch_chroot /mnt ./setup_internal.sh
+
+# Cleaning
+rm -f /mnt/setup_internal.sh
+
+echo "========================================================================"
+echo "---------------------- INSTALLATION COMPLETED --------------------------"
+echo "========================================================================"
+echo ""
+echo "reboot the system and remove the installation media"
+echo ""
+
+EOF
